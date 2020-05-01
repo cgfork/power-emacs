@@ -247,7 +247,7 @@ an error. "
 installed successfully, otherwise return nil."
   (condition-case err
       (progn
-	(apply #'power-emacs pkg plist)
+	(apply #'power-emacs-install pkg plist)
 	t)
     (error
      (message "%s" (error-message-string err))
