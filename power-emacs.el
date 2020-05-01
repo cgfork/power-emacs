@@ -4,209 +4,261 @@
 
 ;; Author: cgfork
 ;; Version: 0.0.1
+;; URL: https://github.com/cgfork/power-emacs
+;; Package-Requires: ((emacs "25.3"))
 
 ;;; Commentary:
 ;;; Code:
 
-;; Define consts
-(defconst sys/win32p
-  (eq system-type 'windows-nt)
-  "Are we running on a WinTel system?")
+(require 'power-emacs-build)
 
-(defconst sys/linuxp
-  (eq system-type 'gnu/linux)
-  "Are we running on a GNU/Linux system?")
+(defcustom power-emacs-banner-file (expand-file-name "banner" power-emacs-base-dir)
+  "Banner file.")
 
-(defconst sys/macp
-  (eq system-type 'darwin)
-  "Are we running on a Mac system?")
+(defcustom power-emacs-melpa-dir (expand-file-name "melpa" user-emacs-directory)
+  "Directory to clone the 'melpa' repository."
+  :group 'power-emacs
+  :type 'string)
 
-(defconst sys/mac-x-p
-  (and (display-graphic-p) sys/macp)
-  "Are we running under X on a Mac system?")
+(defcustom power-emacs-melpa-repo-url "https://github.com/melpa/melpa.git"
+  "The repository for checkouting the melpa sources."
+  :group 'power-emacs
+  :type 'string)
 
-(defconst sys/linux-x-p
-  (and (display-graphic-p) sys/linuxp)
-  "Are we running under X on a GNU/Linux system?")
+(defcustom power-emacs-recipe-archives
+  `(("melpa" . ,(expand-file-name "recipes" power-emacs-melpa-dir))
+    ("power-emacs" . ,(expand-file-name "recipes" power-emacs-base-dir)))
+  "Recipe stores where `power-emacs' finds the recipes for packages."
+  :group 'power-emacs
+  :type 'list)
 
-(defconst sys/cygwinp
-  (eq system-type 'cygwin)
-  "Are we running on a Cygwin system?")
+(defcustom power-emacs-autoremove-enable nil
+  "Remove the obsoleted packages automatically if non-nil."
+  :group 'power-emacs
+  :type 'boolean)
 
-(defconst sys/rootp
-  (string-equal "root" (getenv "USER"))
-  "Are you using ROOT user?")
+(defvar power-emacs-recipe-alist nil
+  "Cache the recipe contents stored in the `power-emacs-recipe-archives'.")
 
-(defconst emacs/>=25p
-  (>= emacs-major-version 25)
-  "Emacs is 25 or above.")
+(defun power-emacs--update-recipe-alist (archive rcp)
+  "Update `power-emacs-recipe-alist' with the given ARCHIVE and RCP object."
+  (when (and (stringp archive)
+	     (power-emacs-recipe-p rcp))
+    (let* ((name (power-emacs-recipe-name rcp))
+	   (exist (assq name power-emacs-recipe-alist)))
+      (when exist
+	(setq power-emacs-recipe-alist
+	      (assq-delete-all name power-emacs-recipe-alist)))
+      (setq power-emacs-recipe-alist
+	    (cons (list name archive rcp)
+		  power-emacs-recipe-alist)))))
 
-(defconst emacs/>=26p
-  (>= emacs-major-version 26)
-  "Emacs is 26 or above.")
+(defun power-emacs--read-recipe-alist (archive)
+  "Read the recipe contents stored in the ARCHIVE."
+  (let ((archive-name (car archive))
+	(dir (cdr archive)))
+    (when (file-directory-p dir)
+      (dolist (file (directory-files dir))
+	(unless (string-prefix-p "." file)
+	  (when-let ((rcp (power-emacs-build--recipe-lookup file dir)))
+	    (power-emacs--update-recipe-alist archive-name rcp)))))))
 
-(defconst emacs/>=27p
-  (>= emacs-major-version 27)
-  "Emacs is 27 or above.")
+(defun power-emacs--read-recipe-archives ()
+  "Read the recipe contents from `power-emacs-recipe-archives'."
+  (dolist (archive power-emacs-recipe-archives)
+    (when archive
+      (power-emacs--read-recipe-alist archive))))
 
-(defconst emacs/>=25.2p
-  (or emacs/>=26p
-      (and (= emacs-major-version 25) (>= emacs-minor-version 2)))
-  "Emacs is 25.2 or above.")
+(defun power-emacs--recipe-lookup (pkg)
+  "Return a recipe object for the PKG. PKG is a symbol.
+It will resolve the recipe info in the `power-emacs-recipe-contents'.
+If no such recipe exists, then raise an error."
+  (when-let ((entry (assq pkg power-emacs-recipe-alist)))
+    (caddr entry)))
 
-(defgroup power-emacs nil
-  "Define the group for the power-emacs package."
-  :group 'convenience)
+(defun power-emacs--package-recipe (pkg)
+  "Parse the given recipe or pakcage PKG.
+Return the recipe object if it resolved, otherwise raise an error."
+  (pcase pkg
+    (`(,a . nil) (power-emacs--recipe-lookup a))
+    (`(,a . ,b) (apply #'power-emacs-build--recipe-create a b))
+    ((pred symbolp) (power-emacs--recipe-lookup pkg))))
 
-(defcustom power-emacs-package-archives 'tuna
-  "Set package archives from which to fetch the melpa packages."
-  :type '(choice
-	  (const :tag "Melpa" melpa)
-	  (const :tag "Melpa Mirror" melpa-mirror)
-	  (const :tag "Emacs-China" emacs-china)
-	  (const :tag "Netease" netease)
-	  (const :tag "Tuna" tuna))
-  :group 'power-emacs)
+(defun power-emacs--delete-obsoleted-package (name)
+  "Delete obsoleted packages with name NAME."
+  (mapc (lambda (pkg-desc)
+          (with-demoted-errors "Error deleting package: %S"
+            (let ((inhibit-message t))
+              (package-delete pkg-desc))))
+        (cddr (assoc name package-alist))))
 
-(defcustom power-emacs-shell-executable (getenv "SHELL")
-  "Where the environment variables get from."
-  :type 'string
-  :group 'power-emacs)
+(defun power-emacs--package-desc->archive-entry (pkg-desc)
+  "Transform the `package-desc' object PKG-DESC to a (archive . archive-entry) pair."
+  (when (and pkg-desc (package-desc-p pkg-desc))
+    (cons (package-desc-name pkg-desc)
+	  (vector (package-desc-version pkg-desc)
+		  (package-desc-reqs pkg-desc)
+		  (package-desc-summary pkg-desc)
+		  (package-desc-kind pkg-desc)
+		  (package-desc-extras pkg-desc)))))
 
-;;;###autoload
-(defun power-emacs-set-package-archives (archives)
-  "Set specific package ARCHIVES repository for `package-install'."
-  (interactive (list (intern (completing-read
-			      "Choose package archives: "
-			      '(melpa melpa-mirror emacs-china netease tuna)))))
-  (setq package-archives
-	(let* ((no-ssl (and (memq system-type '(windows-nt ms-dos))
-			    (and (or (fboundp 'gnutls-available-p)
-				     (gnutls-available-p)))))
-	       (proto (if no-ssl "http" "https")))
-	  (pcase archives
-	    ('melpa
-             `(,(cons "gnu"   (concat proto "://elpa.gnu.org/packages/"))
-               ,(cons "melpa" (concat proto "://melpa.org/packages/"))))
-            ('melpa-mirror
-             `(,(cons "gnu"   (concat proto "://elpa.gnu.org/packages/"))
-               ,(cons "melpa" (concat proto "://www.mirrorservice.org/sites/melpa.org/packages/"))))
-            ('emacs-china
-             `(,(cons "gnu"   (concat proto "://elpa.emacs-china.org/gnu/"))
-               ,(cons "melpa" (concat proto "://elpa.emacs-china.org/melpa/"))))
-            ('netease
-             `(,(cons "gnu"   (concat proto "://mirrors.163.com/elpa/gnu/"))
-               ,(cons "melpa" (concat proto "://mirrors.163.com/elpa/melpa/"))))
-            ('tuna
-             `(,(cons "gnu"   (concat proto "://mirrors.tuna.tsinghua.edu.cn/elpa/gnu/"))
-               ,(cons "melpa" (concat proto "://mirrors.tuna.tsinghua.edu.cn/elpa/melpa/"))))
-            (archives
-             (error "Unknown archives: '%s'" archives)))))
-  (message "Set package archives to '%s'" archives))
+(defun power-emacs--archive-entry->package-desc (archive-entry archive)
+  "Transform the ARCHIVE-ENTRY vector to `package-desc' object."
+  (let* ((name (car archive-entry))
+	  (pkg-info (cdr archive-entry))
+	  (version (aref pkg-info 0))
+	  (requires (aref pkg-info 1))
+	  (desc (aref pkg-info 2))
+	  (kind (aref pkg-info 3))
+	  (extras (aref pkg-info 4)))
+    (package-desc-create :name name
+			 :version version
+			 :summary desc
+			 :reqs requires
+			 :kind kind
+			 :archive archive
+			 :dir "builtin"
+			 :extras extras
+			 :signed nil)))
 
-;;;###autoload
-(defun power-emacs-get-shell-variable (name &optional shell)
-  "Return the value associated with the NAME in the default shell environments 
-or in the SHELL environments if it exists."
-  (let* ((shell (or shell power-emacs-shell-executable))
-	 (shell-exec (executable-find shell))
-	 (name (cond
-		((stringp name) name)
-		((symbolp name) (symbol-name name))
-		(t (error "Unknown name %S" name))))
-	 (printf (or (executable-find "printf") "printf"))
-	 (printf-command (concat printf " '%s' " (format "${%s}" name)))
-	 (shell-args (cond
-		      ((string-match-p "t?csh$" shell)
-		       `("-d" "-c" ,(concat "sh -c" printf-command)))
-		      ((string-match-p "fish" shell)
-		       `("-l" "-c" ,(concat "sh -c" printf-command)))
-		      (t
-		       `("-l" "-i" "-c" ,printf-command)))))
-    (with-temp-buffer
-      (let ((exit-code (apply #'call-process shell nil t nil shell-args)))
-	(unless (zerop exit-code)
-	  (error "Non-zero exit code when execute `%s' with '%S'" shell shell-args)))
-      (buffer-string))))
+(defun power-emacs--archive-file (pkg-desc)
+  "Return the archive file from the PKG-DESC."
+  (when (package-desc-p pkg-desc)
+    (let ((name (package-desc-name pkg-desc))
+	  (version (package-version-join (package-desc-version pkg-desc)))
+	  (kind (package-desc-kind pkg-desc)))
+      (expand-file-name
+       (format "%s-%s.%s" name version (if (eq kind 'single) "el" "tar"))
+       power-emacs-build-archive-dir))))
 
-;;;###autoload
-(defun power-emacs-set-shell-variable (name value)
-  "Set the value of environment variable NAME to VALUE.
-If NAME is 'PATH', it will also set corresponding variables
-such as `exec-path', `eshell-path-env' and so on."
-  (setenv name value)
-  (when (and (string-equal "PATH" name)
-	     (not (string-empty-p value)))
-    (setq eshell-path-env value
-	  exec-path (append (parse-colon-path value) (list exec-directory)))))
+(defun power-emacs--package-type (file)
+  "Determine the package type of FILE.
+Return `tar' for tarball packages, `single' for single file
+packages, or nil, if FILE is not a package."
+  (let ((ext (file-name-extension file)))
+    (cond
+     ((string= ext "tar") 'tar)
+     ((string= ext "el") 'single)
+     (:else nil))))
 
-;;;###autoload
-(defun power-emacs-copy-shell-variables (shell &rest vars)
-  "Set the environment VARS from the given SHELL.
-It will returns the pairs that are set into the environment variables."
-  (mapcar (lambda (name)
-	    (let ((value (condition-case err
-			     (power-emacs-get-shell-variable name shell)
-			   (message "get %s variable error, skip it" name))))
-	      (if value
-		  (progn (power-emacs-set-shell-variable name value)
-			 (cons name value))
-		(cons name nil))))
-	  vars))
+(defun power-emacs--get-package-desc (file)
+  "Extract and return the PACKAGE-DESC object from FILE.
+On error return nil."
+  (let* ((kind (power-emacs--package-type file))
+         (desc (with-demoted-errors "Error getting PACKAGE-DESC: %s"
+                 (with-temp-buffer
+                   (pcase kind
+                     (`single (insert-file-contents file)
+                              (package-buffer-info))
+                     (`tar (insert-file-contents-literally file)
+                           (tar-mode)
+                           (with-no-warnings
+                             (package-tar-file-info))))))))
+    (when (package-desc-p desc)
+      desc)))
 
-;;;###autoload
-(defun power-emacs-apply-themes ()
-  "Forcibly load the thems listed in the `custom-enabled-themes'."
-  (dolist (theme custom-enabled-themes)
-    (unless (custom-theme-p theme)
-      (load-theme theme))
-    (custom-set-variables `(custom-enabled-themes (quote ,custom-enabled-themes)))))
+(defvar power-emacs--already-setup nil)
 
 ;;;###autoload
-(defun power-emacs-rename-this-file-and-buffer (name)
-  "Rename both current buffer and file to the NAME."
-  (interactive (list (read-string (format "Rename %s to: " (buffer-name)))))
-  (let ((bname (buffer-name))
-	(fname (buffer-file-name)))
-    (unless fname
-      (error "Buffer '%s' is not a visiting file!" bname))
-    (progn
-      (when (file-exists-p fname)
-	(rename-file fname name 1))
-      (set-visited-file-name name)
-      (rename-buffer name))))
+(defun power-emacs-setup ()
+  "Intialize the directories, checkout melpa repo and load all packages.
+PLIST provides additional process before installing package."
+  (interactive nil)
+  (dolist (dir (list power-emacs-base-dir power-emacs-build-working-dir power-emacs-build-archive-dir))
+    (unless (file-exists-p dir)
+      (progn
+	(power-emacs-build--message "Create directory: %s" dir)
+	(make-directory dir t))))
+  (unless power-emacs--already-setup
+    (power-emacs-build--message "Setup POWER-EMACS")
+    (power-emacs--read-recipe-archives)
+    (unless (bound-and-true-p package--initialized)
+      (package-initialize))
+    (setq power-emacs--already-setup t)))
 
 ;;;###autoload
-(defun power-emacs-delete-this-file ()
-  "Delete the current file and kill the current buffer."
-  (interactive)
-  (let ((file-name (buffer-file-name))
-	(buf-name (current-buffer)))
-    (unless file-name
-      (error "No file is currently being edited!"))
-    (when (yes-or-no-p (format "Are you sure to delete '%s'?"
-			       (file-name-nondirectory file-name)))
-      (delete-file file-name)
-      (kill-buffer buf-name))))
+(defun power-emacs-refresh-recipe-alist ()
+  "Reload the `power-emacs-recipe-alist' from the `power-emacs-recipe-archives'."
+  (setq power-emacs-recipe-alist nil)
+  (power-emacs--read-recipe-archives))
 
 ;;;###autoload
-(defun power-emacs-open-in-browse ()
-  "Open the current file using `browse-url'."
-  (interactive)
-  (let ((file-name (buffer-file-name)))
-    (if (and (fboundp 'tramp-tramp-file-p)
-	     (tramp-tramp-file-p file-name))
-	    (error "Cannot open tramp file")
-      (browse-url (concat "file://" file-name)))))
+(defun power-emacs-package-build (rcp)
+  "Checkout and build package specified by RCP object.
+PLIST is a plist that provides additional config
+for building the package. Return a `package-desc' object
+if it builds successfully, otherwise nil."
+  (when-let ((archive-entry (power-emacs-build rcp)))
+    (let ((entry (assq (power-emacs-recipe-name rcp) power-emacs-recipe-alist)))
+      (if entry
+	  (power-emacs--archive-entry->package-desc archive-entry
+					    (cadr entry))
+	(power-emacs--get-package-desc (power-emacs-build--artifact-file archive-entry))))))
 
 ;;;###autoload
-(defun power-emacs-open-recentf ()
-  "Open the recent file."
-  (interactive)
-  (when (featurep 'recentf)
-    (let ((file (completing-read "Open: " recentf-list)))
-      (if (file-exists-p file)
-	  (find-file file)))))
+(defun power-emacs-package-install (pkg &rest plist)
+  "Checkout, build and install a package named PKG. Resolve the recipe from 
+the STORE. PLIST is addtional options for building and installing. Return 
+the `package-desc' object if it installed successfully."
+  (unless power-emacs--already-setup
+    (error "Must setup before `power-emacs-package-install'."))
+  (let ((power-emacs-autoremove-enable power-emacs-autoremove-enable) ;; shadow
+	(power-emacs-build-stable power-emacs-build-stable)) ;; shadow
+    (while plist
+      (let ((key (car plist))
+	    (val (cadr plist)))
+	(pcase key
+	  (:autoremove (setq power-emacs-autoremove-enable val))
+	  (:stable (setq power-emacs-build-stable val))))
+      (setq plist (cddr plist))) 
+    (let* ((rcp (power-emacs--package-recipe pkg))
+	   (pkg-desc (and rcp (power-emacs-package-build rcp))))
+      (when pkg-desc
+	(when-let ((requires (package-desc-reqs pkg-desc)))
+	  (mapc (lambda (r)
+		  (unless (or (equal 'emacs (car r))
+			      (package-installed-p (car r) (cadr r)))
+		    (power-emacs-package-install (car r))))
+		requires))
+	(when-let ((file (power-emacs--archive-file pkg-desc)))
+	  (package-install-file file))
+	(when power-emacs-autoremove-enable
+	  (power-emacs--delete-obsoleted-package (power-emacs-recipe-name rcp)))
+	pkg-desc))))
+
+;;;###autoload
+(defun power-emacs-install (pkg &rest plist)
+  "Install the PKG if it was not installed. Return t if the PKG has already
+installed via `power-emacs'. Install the PKG if it non-installed, otherwise raise
+an error. "
+  (interactive (list nil))
+  (power-emacs-setup)
+  (let ((min-version (plist-get plist :min-version))
+	(pkg-name (if (symbolp pkg)
+		      pkg
+		    (car pkg))))
+    (unless (or (package-installed-p pkg-name min-version)
+		(apply #'power-emacs-package-install pkg plist))
+      (error "Failed to install `%s'" pkg-name))))
+
+;;;###autoload
+(defun power-emacs-try (pkg &rest plist)
+  "Try to install the PKG if it was not installed. Return non-nil if the PKG
+installed successfully, otherwise return nil."
+  (condition-case err
+      (progn
+	(apply #'power-emacs pkg plist)
+	t)
+    (error
+     (message "%s" (error-message-string err))
+     nil)))
+
+;;;###autoload
+(defun power-emacs ()
+  "Return the banner of power emacs."
+  (with-temp-buffer
+    (insert-file-contents-literally power-emacs-banner-file)
+    (buffer-string)))
 
 (provide 'power-emacs)
 ;;; power-emacs.el ends here
