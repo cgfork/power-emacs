@@ -1,0 +1,2 @@
+(power-emacs :fetcher github
+	     :repo "cgfork/power-emacs")
