@@ -75,19 +75,21 @@ or in the SHELL environments if it exists."
 		((symbolp name) (symbol-name name))
 		(t (error "Unknown name %S" name))))
 	 (printf (or (executable-find "printf") "printf"))
-	 (printf-command (concat printf " '%s' " (format "${%s}" name)))
+	 (printf-command (concat printf " '%s'" (format "${%s}" name)))
 	 (shell-args (cond
 		      ((string-match-p "t?csh$" shell)
 		       `("-d" "-c" ,(concat "sh -c" printf-command)))
 		      ((string-match-p "fish" shell)
 		       `("-l" "-c" ,(concat "sh -c" printf-command)))
 		      (t
-		       `("-l" "-i" "-c" ,printf-command)))))
+		       `("-l" "-c" ,printf-command)))))
     (with-temp-buffer
       (let ((exit-code (apply #'call-process shell-exec nil t nil shell-args)))
 	(unless (zerop exit-code)
 	  (error "Non-zero exit code when execute `%s' with '%S'" shell shell-args)))
       (buffer-string))))
+
+(power-emacs-get-shell-variable "GOPATH" "zsh")
 
 ;;;###autoload
 (defun power-emacs-set-shell-variable (name value)
